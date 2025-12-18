@@ -45,14 +45,20 @@ class Integrator {
 
     virtual void Render() = 0;
 
+    // 相交函数，返回相交点点几何信息，实际就是调用aggregate的Intersect函数
     pstd::optional<ShapeIntersection> Intersect(const Ray &ray,
                                                 Float tMax = Infinity) const;
+
+    // 相交函数，只返回是否相交，节省计算量，实际就是调用aggregate的IntersectP函数
     bool IntersectP(const Ray &ray, Float tMax = Infinity) const;
 
+    // 判断p0和p1之间是否有物体阻挡
     bool Unoccluded(const Interaction &p0, const Interaction &p1) const {
         return !IntersectP(p0.SpawnRayTo(p1), 1 - ShadowEpsilon);
     }
 
+    // 计算光从场景中的一个点p0传播到另一个点p1的透射率
+    // 也就是光从p0传递到p1，剩下的比例
     SampledSpectrum Tr(const Interaction &p0, const Interaction &p1,
                        const SampledWavelengths &lambda) const;
 
@@ -66,8 +72,11 @@ class Integrator {
     Integrator(Primitive aggregate, std::vector<Light> lights)
         : aggregate(aggregate), lights(lights) {
         // Integrator constructor implementation
+        // 计算场景包围盒
         Bounds3f sceneBounds = aggregate ? aggregate.Bounds() : Bounds3f();
         LOG_VERBOSE("Scene bounds %s", sceneBounds);
+
+        // 光源处理：调用光源预处理函数，将无穷远光源添加到无穷远光源列表
         for (auto &light : lights) {
             light.Preprocess(sceneBounds);
             if (light.Type() == LightType::Infinite)

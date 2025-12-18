@@ -731,32 +731,47 @@ PBRT_CPU_GPU SampledSpectrum SampleT_maj(Ray ray, Float tMax, Float u, RNG &rng,
     return ray.medium.Dispatch(sample);
 }
 
+// majorant采样，对“上界”采样，然后按照一定概率接受
+// 沿着一条给定的光线，在介质中采样一系列可能的“交互事件”（如散射、吸收），并允许调用者灵活地处理这些事件
 template <typename ConcreteMedium, typename F>
 PBRT_CPU_GPU SampledSpectrum SampleT_maj(Ray ray, Float tMax, Float u, RNG &rng,
                                          const SampledWavelengths &lambda, F callback) {
     // Normalize ray direction and update _tMax_ accordingly
+    // 归一化光线的方向，将参数距离转为实际的物理距离
     tMax *= Length(ray.d);
     ray.d = Normalize(ray.d);
 
     // Initialize _MajorantIterator_ for ray majorant sampling
+    // medium能提供沿光线的分段majorant（sigma_maj，即散射系数的上界）和任意点的真实介质属性
     ConcreteMedium *medium = ray.medium.Cast<ConcreteMedium>();
+
+    // sampleRay返回RayMajorantSegment，它包含
+    // 1）tMin, tMax：此分段在光线上的起止距离。
+    // 2）在此分段内，介质散射系数的光谱上界（一个 SampledSpectrum）。
+    // 这意味着对于分段内任一点，真实的散射系数 sigma_t 的任何通道值都 ≤ sigma_maj 的对应通道值
     typename ConcreteMedium::MajorantIterator iter = medium->SampleRay(ray, tMax, lambda);
 
     // Generate ray majorant samples until termination
     SampledSpectrum T_maj(1.f);
     bool done = false;
+    // 遍历由迭代器iter提供的每一个RayMajorantSegment分段
     while (!done) {
         // Get next majorant segment from iterator and sample it
         pstd::optional<RayMajorantSegment> seg = iter.Next();
         if (!seg)
             return T_maj;
+
         // Handle zero-valued majorant for current segment
         if (seg->sigma_maj[0] == 0) {
+            // sigma_maj[0]，则认为在这个分段内，对所有波长的真实散射系数为0
+            // 物理情况，这段空间是真空，或者是一种在任何波长都完全透明、不发生任何吸收或散射的“理想透明”介质
             Float dt = seg->tMax - seg->tMin;
             // Handle infinite _dt_ for ray majorant segment
             if (IsInf(dt))
                 dt = std::numeric_limits<Float>::max();
 
+            // 将指数衰减累乘到T_maj上
+            // 实际上就是T_maj，因为衰减是0，为了保持代码一致性，写了公式
             T_maj *= FastExp(-dt * seg->sigma_maj);
             continue;
         }
@@ -765,26 +780,35 @@ PBRT_CPU_GPU SampledSpectrum SampleT_maj(Ray ray, Float tMax, Float u, RNG &rng,
         Float tMin = seg->tMin;
         while (true) {
             // Try to generate sample along current majorant segment
+            // 采样服从指数分布的距离t
             Float t = tMin + SampleExponential(u, seg->sigma_maj[0]);
             PBRT_DBG("Sampled t = %f from tMin %f u %f sigma_maj[0] %f\n", t, tMin, u,
                      seg->sigma_maj[0]);
             u = rng.Uniform<Float>();
             if (t < seg->tMax) {
                 // Call callback function for sample within segment
+                // 采样点落在分段内
                 PBRT_DBG("t < seg->tMax\n");
+
+                // 累计衰减
                 T_maj *= FastExp(-(t - tMin) * seg->sigma_maj);
+
+                // 查询采样点处的真实介质属性
                 MediumProperties mp = medium->SamplePoint(ray(t), lambda);
                 if (!callback(ray(t), mp, seg->sigma_maj, T_maj)) {
+                    // 由callback的结果决定是否继续采样
                     // Returning out of doubly-nested while loop is not as good perf. wise
                     // on the GPU vs using "done" here.
                     done = true;
                     break;
                 }
+                // 已经处理的t内的区间，重置
                 T_maj = SampledSpectrum(1.f);
                 tMin = t;
 
             } else {
                 // Handle sample past end of majorant segment
+                // 候选点超出了当前分段
                 Float dt = seg->tMax - tMin;
                 // Handle infinite _dt_ for ray majorant segment
                 if (IsInf(dt))

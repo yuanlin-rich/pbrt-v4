@@ -66,6 +66,7 @@ Integrator::~Integrator() {}
 void ImageTileIntegrator::Render() {
     // Handle debugStart, if set
     if (!Options->debugStart.empty()) {
+        // 调试，应该解析出三个int值，x，y，sample index，解析错误直接返回
         std::vector<int> c = SplitStringToInts(Options->debugStart, ',');
         if (c.empty())
             ErrorExit("Didn't find integer values after --debugstart: %s",
@@ -81,6 +82,7 @@ void ImageTileIntegrator::Render() {
         Sampler tileSampler = samplerPrototype.Clone(Allocator());
         tileSampler.StartPixelSample(pPixel, sampleIndex);
 
+        // 只计算指定x，y，sample index的像素，然后直接返回
         EvaluatePixelSample(pPixel, sampleIndex, tileSampler, scratchBuffer);
 
         return;
@@ -159,6 +161,7 @@ void ImageTileIntegrator::Render() {
     }
 
     // Render image in waves
+    // spp样本个数
     while (waveStart < spp) {
         // Render current wave's image tiles in parallel
         ParallelFor2D(pixelBounds, [&](Bounds2i tileBounds) {
@@ -168,6 +171,8 @@ void ImageTileIntegrator::Render() {
             PBRT_DBG("Starting image tile (%d,%d)-(%d,%d) waveStart %d, waveEnd %d\n",
                      tileBounds.pMin.x, tileBounds.pMin.y, tileBounds.pMax.x,
                      tileBounds.pMax.y, waveStart, waveEnd);
+
+            // 遍历tile内的所有像素
             for (Point2i pPixel : tileBounds) {
                 StatsReportPixelStart(pPixel);
                 threadPixel = pPixel;
@@ -226,17 +231,22 @@ void ImageTileIntegrator::Render() {
 // RayIntegrator Method Definitions
 void RayIntegrator::EvaluatePixelSample(Point2i pPixel, int sampleIndex, Sampler sampler,
                                         ScratchBuffer &scratchBuffer) {
+    // 为给定像素和样本生成一条光线，追踪它，计算结果颜色，并提交给胶片
     // Sample wavelengths for the ray
     Float lu = sampler.Get1D();
     if (Options->disableWavelengthJitter)
         lu = 0.5;
+    
+    // 采样波长，这条光线计算那些波长
     SampledWavelengths lambda = camera.GetFilm().SampleWavelengths(lu);
 
     // Initialize _CameraSample_ for current sample
+    // 生成相机样本
     Filter filter = camera.GetFilm().GetFilter();
     CameraSample cameraSample = GetCameraSample(sampler, pPixel, filter);
 
     // Generate camera ray for current sample
+    // 生成光线
     pstd::optional<CameraRayDifferential> cameraRay =
         camera.GenerateRayDifferential(cameraSample, lambda);
 
@@ -314,11 +324,15 @@ bool Integrator::IntersectP(const Ray &ray, Float tMax) const {
 
 SampledSpectrum Integrator::Tr(const Interaction &p0, const Interaction &p1,
                                const SampledWavelengths &lambda) const {
+    // 这里只处理了不透明物体表面和介质，没有处理透明表面，需要进一步阅读代码找出透明表面的处理逻辑
     RNG rng(Hash(p0.p()), Hash(p1.p()));
 
     // :-(
+    // 生成从p0到p1点光线
     Ray ray =
         p0.IsSurfaceInteraction() ? p0.AsSurface().SpawnRayTo(p1) : p0.SpawnRayTo(p1);
+
+    // 初始化，透视率和采样性权重
     SampledSpectrum Tr(1.f), inv_w(1.f);
     if (LengthSquared(ray.d) == 0)
         return Tr;
@@ -327,23 +341,35 @@ SampledSpectrum Integrator::Tr(const Interaction &p0, const Interaction &p1,
         pstd::optional<ShapeIntersection> si = Intersect(ray, 1 - ShadowEpsilon);
         // Handle opaque surface along ray's path
         if (si && si->intr.material)
+            // 如果击中的有材质的表面（不透明表面），直接返回透射率0
             return SampledSpectrum(0.0f);
 
         // Update transmittance for current ray segment
         if (ray.medium) {
+            // 如果光线在介质中，则计算介质造成的光线衰减
             Point3f pExit = ray(si ? si->tHit : (1 - ShadowEpsilon));
             ray.d = pExit - ray.o;
 
+            // 采用majorant采样跟踪光线在非均匀介质中的传播
             SampledSpectrum T_maj =
                 SampleT_maj(ray, 1.f, rng.Uniform<Float>(), rng, lambda,
                             [&](Point3f p, MediumProperties mp, SampledSpectrum sigma_maj,
                                 SampledSpectrum T_maj) {
+                                // 使用比例跟踪 (ratio-tracking)，估算透射率
+                                // 计算0散射系数，确保其非负，sigma_a代表吸收，sigma_s代表散射
                                 SampledSpectrum sigma_n =
                                     ClampZero(sigma_maj - mp.sigma_a - mp.sigma_s);
 
                                 // ratio-tracking: only evaluate null scattering
+                                // 光线“存活”到该点的majorant透射率
+
+                                // 计算“虚拟介质”中，在当前点采样到任意事件的概率密度（非归一化）。
                                 Float pr = T_maj[0] * sigma_maj[0];
+
+                                // 更新透射率估计量 Tr。累积(真实零散射概率密度) / (虚拟事件概率密度)
                                 Tr *= T_maj * sigma_n / pr;
+
+                                // 更新重要性权重inv_w，累积(虚拟事件概率密度) / (虚拟事件概率密度)
                                 inv_w *= T_maj * sigma_maj / pr;
 
                                 if (!Tr || !inv_w)
@@ -357,7 +383,9 @@ SampledSpectrum Integrator::Tr(const Interaction &p0, const Interaction &p1,
 
         // Generate next ray segment or return final transmittance
         if (!si)
+            // 未击中任何表面，已到达p1
             break;
+        // 击中区分介质的表面，生成新的光线（pbrt中用没有材质的表面表示介质的边界）
         ray = si->intr.SpawnRayTo(p1);
     }
     PBRT_DBG("%s\n", StringPrintf("Tr from %s to %s = %s", p0.pi, p1.pi, Tr).c_str());
@@ -393,13 +421,18 @@ SampledSpectrum SimplePathIntegrator::Li(RayDifferential ray, SampledWavelengths
     SampledSpectrum L(0.f), beta(1.f);
     bool specularBounce = true;
     int depth = 0;
+    // beta 作为权重，表示路径到达某点的概率
     while (beta) {
         // Find next _SimplePathIntegrator_ vertex and accumulate contribution
         // Intersect _ray_ with scene
+        // 光线和场景求相交点
         pstd::optional<ShapeIntersection> si = Intersect(ray);
 
         // Account for infinite lights if ray has no intersection
         if (!si) {
+            // 光线未击中任何物体，则看向“无限远”的环境（如天空盒）
+            // 仅在 sampleLights 为假（不主动采样光源）或 specularBounce 为真（上一个反弹是镜面反射）时，才累加环境光。
+            // 这是因为对于光滑表面，直接采样光源效率很低，而从环境贴图获取颜色更为合适
             if (!sampleLights || specularBounce)
                 for (const auto &light : infiniteLights)
                     L += beta * light.Le(ray, lambda);
@@ -409,6 +442,7 @@ SampledSpectrum SimplePathIntegrator::Li(RayDifferential ray, SampledWavelengths
         // Account for emissive surface if light was not sampled
         SurfaceInteraction &isect = si->intr;
         if (!sampleLights || specularBounce)
+            // 如果交点是自发光表面（如灯泡），同样仅在上述条件下累加其发光贡献Le。
             L += beta * isect.Le(-ray.d, lambda);
 
         // End path if maximum depth reached
@@ -416,6 +450,8 @@ SampledSpectrum SimplePathIntegrator::Li(RayDifferential ray, SampledWavelengths
             break;
 
         // Get BSDF and skip over medium boundaries
+        // 获取交点的bsdf
+        // 如果bsdf为空，则是介质的交界，光线继续前进
         BSDF bsdf = isect.GetBSDF(ray, lambda, camera, scratchBuffer, sampler);
         if (!bsdf) {
             specularBounce = true;
@@ -426,15 +462,19 @@ SampledSpectrum SimplePathIntegrator::Li(RayDifferential ray, SampledWavelengths
         // Sample direct illumination if _sampleLights_ is true
         Vector3f wo = -ray.d;
         if (sampleLights) {
+            // 采样光源，根据光源的功率或者重要性，从所有光源随机选出一个
             pstd::optional<SampledLight> sampledLight =
                 lightSampler.Sample(sampler.Get1D());
             if (sampledLight) {
                 // Sample point on _sampledLight_ to estimate direct illumination
                 Point2f uLight = sampler.Get2D();
+                // 在选中的光源上随机选取一个点 ls->pLight
+                // 并返回该点指向交点的方向 wi、光强 ls->L 以及该采样点的概率密度 ls->pdf
                 pstd::optional<LightLiSample> ls =
                     sampledLight->light.SampleLi(isect, uLight, lambda);
                 if (ls && ls->L && ls->pdf > 0) {
                     // Evaluate BSDF for light and possibly add scattered radiance
+                    // 光源和交点中间没有遮挡，则累加光源贡献
                     Vector3f wi = ls->wi;
                     SampledSpectrum f = bsdf.f(wo, wi) * AbsDot(wi, isect.shading.n);
                     if (f && Unoccluded(isect, ls->pLight))
@@ -446,16 +486,24 @@ SampledSpectrum SimplePathIntegrator::Li(RayDifferential ray, SampledWavelengths
         // Sample outgoing direction at intersection to continue path
         if (sampleBSDF) {
             // Sample BSDF for new path direction
+            // 根据bsdf的分布，采样出新的光源方向
             Float u = sampler.Get1D();
             pstd::optional<BSDFSample> bs = bsdf.Sample_f(wo, u, sampler.Get2D());
             if (!bs)
                 break;
+            
+            // 更新beta
             beta *= bs->f * AbsDot(bs->wi, isect.shading.n) / bs->pdf;
+
+            // 记录是否是镜像反射
             specularBounce = bs->IsSpecular();
+
+            // 新的光线
             ray = isect.SpawnRay(bs->wi);
 
         } else {
             // Uniformly sample sphere or hemisphere to get new path direction
+            // 在球或者半球上均匀采样获取新的光源方向
             Float pdf;
             Vector3f wi;
             BxDFFlags flags = bsdf.Flags();
@@ -470,8 +518,14 @@ SampledSpectrum SimplePathIntegrator::Li(RayDifferential ray, SampledWavelengths
                 else if (IsTransmissive(flags) && Dot(wo, isect.n) * Dot(wi, isect.n) > 0)
                     wi = -wi;
             }
+
+            // 更新beta
             beta *= bsdf.f(wo, wi) * AbsDot(wi, isect.shading.n) / pdf;
+
+            // 记录是否是镜像反射
             specularBounce = false;
+
+            // 新的光线
             ray = isect.SpawnRay(wi);
         }
 
@@ -639,16 +693,20 @@ SampledSpectrum PathIntegrator::Li(RayDifferential ray, SampledWavelengths &lamb
     // Sample path from camera and accumulate radiance estimate
     while (true) {
         // Trace ray and find closest path vertex and its BSDF
+        // 光线和场景的交点
         pstd::optional<ShapeIntersection> si = Intersect(ray);
         // Add emitted light at intersection point or from the environment
         if (!si) {
             // Incorporate emission from infinite lights for escaped ray
+            // 光线和场景没有相交点，累计"无穷远"光源的贡献
             for (const auto &light : infiniteLights) {
                 SampledSpectrum Le = light.Le(ray, lambda);
                 if (depth == 0 || specularBounce)
+                    // 直接光照或者上次反射是镜面反射，直接累加，无需mis修正
                     L += beta * Le;
                 else {
                     // Compute MIS weight for infinite light
+                    // 计算mis权重
                     Float p_l = lightSampler.PMF(prevIntrCtx, light) *
                                 light.PDF_Li(prevIntrCtx, ray.d, true);
                     Float w_b = PowerHeuristic(1, p_b, 1, p_l);
@@ -656,16 +714,19 @@ SampledSpectrum PathIntegrator::Li(RayDifferential ray, SampledWavelengths &lamb
                     L += beta * w_b * Le;
                 }
             }
-
             break;
         }
+
         // Incorporate emission from surface hit by ray
+        // 处理物体的自发光
         SampledSpectrum Le = si->intr.Le(-ray.d, lambda);
         if (Le) {
             if (depth == 0 || specularBounce)
+                // 直接光或者上次反射是镜面反射，直接累加，无需mis修正
                 L += beta * Le;
             else {
                 // Compute MIS weight for area light
+                // 计算mis权重
                 Light areaLight(si->intr.areaLight);
                 Float p_l = lightSampler.PMF(prevIntrCtx, areaLight) *
                             areaLight.PDF_Li(prevIntrCtx, ray.d, true);
@@ -679,6 +740,7 @@ SampledSpectrum PathIntegrator::Li(RayDifferential ray, SampledWavelengths &lamb
         // Get BSDF and skip over medium boundaries
         BSDF bsdf = isect.GetBSDF(ray, lambda, camera, scratchBuffer, sampler);
         if (!bsdf) {
+            // 介质表面，禁用mis，并且光线继续前进
             specularBounce = true;  // disable MIS if the indirect ray hits a light
             isect.SkipIntersection(&ray, si->tHit);
             continue;
@@ -686,6 +748,8 @@ SampledSpectrum PathIntegrator::Li(RayDifferential ray, SampledWavelengths &lamb
 
         // Initialize _visibleSurf_ at first intersection
         if (depth == 0 && visibleSurf) {
+            // 首次相交的时候记录相交表面信息，用于后续的后处理
+            // visibleSurf不为空表示要记录表面信息
             // Estimate BSDF's albedo
             // Define sample arrays _ucRho_ and _uRho_ for reflectance estimate
             constexpr int nRhoSamples = 16;
@@ -705,11 +769,14 @@ SampledSpectrum PathIntegrator::Li(RayDifferential ray, SampledWavelengths &lamb
 
             SampledSpectrum albedo = bsdf.rho(isect.wo, ucRho, uRho);
 
+            // 保存交点，反照率，波长信息
             *visibleSurf = VisibleSurface(isect, albedo, lambda);
         }
 
         // Possibly regularize the BSDF
         if (regularize && anyNonSpecularBounces) {
+            // bsdf正则化，受全局开关控制，如果开启并且路径上没有非镜面反射，做bsdf正则化
+            // 对bsdf进行视觉上不可见的微小平滑可以带来视觉上的巨大提升
             ++regularizedBSDFs;
             bsdf.Regularize();
         }
@@ -722,6 +789,7 @@ SampledSpectrum PathIntegrator::Li(RayDifferential ray, SampledWavelengths &lamb
 
         // Sample direct illumination from the light sources
         if (IsNonSpecular(bsdf.Flags())) {
+            // 非镜面反射，调用SampleLd采样光源的贡献
             ++totalPaths;
             SampledSpectrum Ld = SampleLd(isect, &bsdf, lambda, sampler);
             if (!Ld)
@@ -730,24 +798,37 @@ SampledSpectrum PathIntegrator::Li(RayDifferential ray, SampledWavelengths &lamb
         }
 
         // Sample BSDF to get new path direction
+        // 根据bsd分布和光源输出方向，采样得到：1）光源输入方向 2）bsdf的值 3）光源输入方向的概率
         Vector3f wo = -ray.d;
         Float u = sampler.Get1D();
         pstd::optional<BSDFSample> bs = bsdf.Sample_f(wo, u, sampler.Get2D());
         if (!bs)
             break;
         // Update path state variables after surface scattering
+        // 更新beta，beta是重要性采样权重
         beta *= bs->f * AbsDot(bs->wi, isect.shading.n) / bs->pdf;
+
+        // 更新p_b，p_b是用于后续多重重要性采样（MIS）的BSDF采样概率密度
         p_b = bs->pdfIsProportional ? bsdf.PDF(wo, bs->wi) : bs->pdf;
         DCHECK(!IsInf(beta.y(lambda)));
+
+        // 记录上一次是否是镜面反射
         specularBounce = bs->IsSpecular();
+
+        // 记录路径中是否发生过非镜面反弹，用于决定是否对BSDF进行正则化
         anyNonSpecularBounces |= !bs->IsSpecular();
+
+        // 如果本次是透射事件，则更新etaScale
         if (bs->IsTransmission())
             etaScale *= Sqr(bs->eta);
+
+        // prevIntrCtx 更新为当前交点的信息，为下一个顶点计算MIS时提供上下文
         prevIntrCtx = si->intr;
 
         ray = isect.SpawnRay(ray, bsdf, bs->wi, bs->flags, bs->eta);
 
         // Possibly terminate the path with Russian roulette
+        // 俄罗斯轮盘赌
         SampledSpectrum rrBeta = beta * etaScale;
         if (rrBeta.MaxComponentValue() < 1 && depth > 1) {
             Float q = std::max<Float>(0, 1 - rrBeta.MaxComponentValue());
@@ -767,6 +848,7 @@ SampledSpectrum PathIntegrator::SampleLd(const SurfaceInteraction &intr, const B
     // Initialize _LightSampleContext_ for light sampling
     LightSampleContext ctx(intr);
     // Try to nudge the light sampling position to correct side of the surface
+    // 根据反射还是折射，调整相交点位置，防止自相交
     BxDFFlags flags = bsdf->Flags();
     if (IsReflective(flags) && !IsTransmissive(flags))
         ctx.pi = intr.OffsetRayOrigin(intr.wo);
@@ -774,6 +856,7 @@ SampledSpectrum PathIntegrator::SampleLd(const SurfaceInteraction &intr, const B
         ctx.pi = intr.OffsetRayOrigin(-intr.wo);
 
     // Choose a light source for the direct lighting calculation
+    // 根据光源功率或者重要性随机选择一个光源
     Float u = sampler.Get1D();
     pstd::optional<SampledLight> sampledLight = lightSampler.Sample(ctx, u);
     Point2f uLight = sampler.Get2D();
@@ -781,6 +864,7 @@ SampledSpectrum PathIntegrator::SampleLd(const SurfaceInteraction &intr, const B
         return {};
 
     // Sample a point on the light source for direct lighting
+    // 在光源上采样
     Light light = sampledLight->light;
     DCHECK(light && sampledLight->p > 0);
     pstd::optional<LightLiSample> ls = light.SampleLi(ctx, uLight, lambda, true);
@@ -788,6 +872,8 @@ SampledSpectrum PathIntegrator::SampleLd(const SurfaceInteraction &intr, const B
         return {};
 
     // Evaluate BSDF for light sample and check light visibility
+    // 计算光源采样方向上对应bsdf上的值
+    // bsdf上的值为0，或者光源和交点之间有阻挡，则没有贡献
     Vector3f wo = intr.wo, wi = ls->wi;
     SampledSpectrum f = bsdf->f(wo, wi) * AbsDot(wi, intr.shading.n);
     if (!f || !Unoccluded(intr, ls->pLight))
@@ -796,8 +882,10 @@ SampledSpectrum PathIntegrator::SampleLd(const SurfaceInteraction &intr, const B
     // Return light's contribution to reflected radiance
     Float p_l = sampledLight->p * ls->pdf;
     if (IsDeltaLight(light.Type()))
+        // delta光源，不涉及mis
         return ls->L * f / p_l;
     else {
+        // 从BSDF采样方向，看它是否恰好击中光源，然后做mis
         Float p_b = bsdf->PDF(wo, wi);
         Float w_l = PowerHeuristic(1, p_l, 1, p_b);
         return w_l * ls->L * f / p_l;
@@ -840,6 +928,7 @@ SampledSpectrum SimpleVolPathIntegrator::Li(RayDifferential ray,
     int depth = 0;
 
     // Terminate secondary wavelengths before starting random walk
+    // 提前终止某些对光照贡献很小的波长
     lambda.TerminateSecondary();
 
     while (true) {
@@ -853,21 +942,43 @@ SampledSpectrum SimpleVolPathIntegrator::Li(RayDifferential ray,
             RNG rng(hash0, hash1);
 
             // Sample medium using delta tracking
+            // 采样方向的最大距离
             Float tMax = si ? si->tHit : Infinity;
             Float u = sampler.Get1D();
+
+            // 随机数，用于具体决策那种事件（吸收，散射，零散射）
             Float uMode = sampler.Get1D();
+
+            // ampleT_maj函数将沿着光线，基于Majorant密度 sigma_maj 采样一系列候选点p。
+            // 对于每个点，它都会调用我们提供的 Lambda 回调函数
+            // 当 SampleT_maj 选中一个候选点 p 时，它向我们提供
+            // p (Point3f)：候选事件点在世界空间中的精确位置。
+            // mp (MediumProperties)：在点 p 处查询到的真实介质属性。这是从 ray.medium 中获取的，包含：
+            //  sigma_a：吸收系数。
+            //  sigma_s：散射系数。
+            // Le：介质的自发光（如发光烟雾）。
+            // phase：相位函数对象，定义了散射的方向分布。
+            // sigma_maj (SampledSpectrum)：当前Majorant分段的上界散射系数。
+            // T_maj (SampledSpectrum)：从光线起点到当前点 p，在Majorant虚拟介质中的累积透射率（即“存活”概率
             SampleT_maj(ray, tMax, u, rng, lambda,
                         [&](Point3f p, MediumProperties mp, SampledSpectrum sigma_maj,
                             SampledSpectrum T_maj) {
                             // Compute medium event probabilities for interaction
+                            // 吸收
                             Float pAbsorb = mp.sigma_a[0] / sigma_maj[0];
+
+                            // 散射
                             Float pScatter = mp.sigma_s[0] / sigma_maj[0];
+
+                            // 零散射（穿透）
                             Float pNull = std::max<Float>(0, 1 - pAbsorb - pScatter);
 
                             // Randomly sample medium scattering event for delta tracking
+                            // 随机处理一种事件
                             int mode = SampleDiscrete({pAbsorb, pScatter, pNull}, uMode);
                             if (mode == 0) {
                                 // Handle absorption event for medium sample
+                                // 吸收，累加介质的发光，终止采样
                                 L += beta * mp.Le;
                                 terminated = true;
                                 return false;
@@ -875,12 +986,15 @@ SampledSpectrum SimpleVolPathIntegrator::Li(RayDifferential ray,
                             } else if (mode == 1) {
                                 // Handle regular scattering event for medium sample
                                 // Stop path sampling if maximum depth has been reached
+                                // 散射
+                                // 达到最大深度，终止
                                 if (depth++ >= maxDepth) {
                                     terminated = true;
                                     return false;
                                 }
 
                                 // Sample phase function for medium scattering event
+                                // 相函数采样一个新的光源方向
                                 Point2f u{rng.Uniform<Float>(), rng.Uniform<Float>()};
                                 pstd::optional<PhaseFunctionSample> ps =
                                     mp.phase.Sample_p(-ray.d, u);
@@ -890,7 +1004,10 @@ SampledSpectrum SimpleVolPathIntegrator::Li(RayDifferential ray,
                                 }
 
                                 // Update state for recursive evaluation of $L_\roman{i}$
+                                // 更新beta
                                 beta *= ps->p / ps->pdf;
+
+                                // 更改光线
                                 ray.o = p;
                                 ray.d = ps->wi;
                                 scattered = true;
@@ -898,6 +1015,7 @@ SampledSpectrum SimpleVolPathIntegrator::Li(RayDifferential ray,
 
                             } else {
                                 // Handle null-scattering event for medium sample
+                                // 零散射，为下一个采样点刷新决策随机数
                                 uMode = rng.Uniform<Float>();
                                 return true;
                             }
@@ -905,19 +1023,26 @@ SampledSpectrum SimpleVolPathIntegrator::Li(RayDifferential ray,
         }
         // Handle terminated and unscattered rays after medium sampling
         if (terminated)
+            // 光线被吸收，终止
             return L;
         if (scattered)
+            // 光线被散射，需要从新位置和新方向继续追踪
             continue;
+
         // Add emission to surviving ray
+        // 逃离介质的光线，累加介质对光照的贡献
         if (si)
+            // 表示光线在穿过介质后，击中了一个几何表面
             L += beta * si->intr.Le(-ray.d, lambda);
         else {
+            // 光线穿过介质之后，和场景无交点
             for (const auto &light : infiniteLights)
                 L += beta * light.Le(ray, lambda);
             return L;
         }
 
         // Handle surface intersection along ray path
+        // 处理bsdf，采样新的光源方向等
         BSDF bsdf = si->intr.GetBSDF(ray, lambda, camera, buf, sampler);
         if (!bsdf)
             si->intr.SkipIntersection(&ray, si->tHit);
@@ -954,6 +1079,11 @@ SampledSpectrum VolPathIntegrator::Li(RayDifferential ray, SampledWavelengths &l
                                       Sampler sampler, ScratchBuffer &scratchBuffer,
                                       VisibleSurface *visibleSurf) const {
     // Declare state variables for volumetric path sampling
+    // L：累计的辐射度
+    // beta：路径吞吐量（path throughput），追踪光线传播过程中的能量衰减
+    // r_u，r_l：用于处理介质散射事件的权重调整因子
+    // depth：当前路径深度
+    // etaScale：折射率缩放因子，用于俄罗斯轮盘赌
     SampledSpectrum L(0.f), beta(1.f), r_u(1.f), r_l(1.f);
     bool specularBounce = false, anyNonSpecularBounces = false;
     int depth = 0;
@@ -1992,6 +2122,7 @@ int RandomWalk(const Integrator &integrator, SampledWavelengths &lambda,
                 [&](Point3f p, MediumProperties mp, SampledSpectrum sigma_maj,
                     SampledSpectrum T_maj) {
                     // Compute medium event probabilities for interaction
+                    // 根据介质的真实属性，计算发生吸收，散射，零散射的概率
                     Float pAbsorb = mp.sigma_a[0] / sigma_maj[0];
                     Float pScatter = mp.sigma_s[0] / sigma_maj[0];
                     Float pNull = std::max<Float>(0, 1 - pAbsorb - pScatter);
@@ -2001,11 +2132,13 @@ int RandomWalk(const Integrator &integrator, SampledWavelengths &lambda,
                     int mode = SampleDiscrete({pAbsorb, pScatter, pNull}, um);
                     if (mode == 0) {
                         // Handle absorption for _RandomWalk()_ ray
+                        // 发生了吸收，光子能量被介质彻底吸收，路径终结
                         terminated = true;
                         return false;
 
                     } else if (mode == 1) {
                         // Handle scattering for _RandomWalk()_ ray
+                        // 发生了散射，光子与介质粒子碰撞并改变方向，路径继续
                         beta *= T_maj * mp.sigma_s / (T_maj[0] * mp.sigma_s[0]);
                         // Record medium interaction in _path_ and compute forward density
                         MediumInteraction intr(p, -ray.d, ray.time, ray.medium, mp.phase);
@@ -2036,6 +2169,7 @@ int RandomWalk(const Integrator &integrator, SampledWavelengths &lambda,
 
                     } else {
                         // Handle null scattering for _RandomWalk()_ ray
+                        // 发生了零散射，光子并未真正于介质交互，继续直线前进
                         SampledSpectrum sigma_n =
                             ClampZero(sigma_maj - mp.sigma_a - mp.sigma_s);
                         Float pdf = T_maj[0] * sigma_n[0];
